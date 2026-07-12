@@ -1,74 +1,68 @@
-# Samsung Manuals RAG
+# Repair Manual RAG (MyFixit)
 
-A Retrieval-Augmented Generation (RAG) pipeline for Samsung product manuals.
-Indexes manuals into Qdrant with per-product metadata, so questions can be
-answered from a specific device's manual (e.g. "Galaxy S24 only") instead of
-searching everything at once.
+A Retrieval-Augmented Generation (RAG) pipeline over the [MyFixit dataset](https://github.com/rub-ksv/MyFixit-Dataset)
+— 31,601 repair manuals across 15 device categories, collected from
+[iFixit](https://www.ifixit.com). Indexed into Qdrant with per-guide
+metadata (category, subject, guide title) so questions can be scoped to a
+specific device category (e.g. "Phone" only) instead of searching everything.
 
-## Why Qdrant instead of FAISS
+## Why this pivot
 
-A related project of mine, [pdf_q-a](https://github.com/shreyaakamra/pdf_q-a),
-uses FAISS for a general-purpose "upload any PDF, ask about it" tool. This
-project deliberately uses Qdrant instead, because the use case is different:
-a fixed catalog of manuals that benefits from **metadata filtering**
-(product, category) that a plain FAISS index doesn't give you out of the box.
-Qdrant runs as its own service with a query API that supports filtering
-alongside vector search, which is the main reason for the swap.
+An earlier version of this project scraped Samsung manuals directly as
+PDFs. This dataset is a better fit for a few reasons:
 
-## Features
+- **Already structured** — each manual is JSON with steps pre-segmented,
+  so there's no PDF text-extraction step (no scanned pages, no broken
+  table extraction, no OCR needed).
+- **Metadata included** — `Category`, `Subject`, and `Title` map directly
+  onto the filtering fields the pipeline needs, instead of being
+  hand-typed per manual.
+- **Clearly licensed for this use** — released for research/dataset use;
+  cite the paper below if you use it.
 
-- Downloads and organizes manuals from Samsung's own support pages
-- Chunks and embeds manual text, indexed into Qdrant with metadata
-  (`product_name`, `category`, `manual_type`, `page_number`)
-- Filtered semantic search — scope a query to one product or category
-- Same chunking approach (`chunk_size=600`, `chunk_overlap=80`) proven out
-  in the sibling `pdf_q-a` project
+Framing note: this is **repair guidance** (how to disassemble/fix a
+device), not general **user manual** content (how to use its features).
+"How do I replace my phone's battery" is a great support-bot query for
+this dataset; "how do I turn on dark mode" is not — that's the kind of
+question the original PDF-manual approach was built for.
 
 ## Setup
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env   # fill in only if using Qdrant Cloud — leave blank for local
 ```
 
-Run Qdrant locally for development:
+Run Qdrant locally:
 
 ```bash
 docker run -p 6333:6333 qdrant/qdrant
 ```
 
-(Or use [Qdrant Cloud](https://cloud.qdrant.io) and set `QDRANT_URL` /
-`QDRANT_API_KEY` in `.env`.)
+## Step 1 — Download category data
 
-## Step 1 — Download manuals
-
-Edit `src/download_manuals.py`: replace the placeholder URLs in the
-`MANUALS` list with real links from Samsung's support/downloads pages
-(samsung.com → Support → search product → Manuals & Downloads → right-click
-PDF → Copy Link Address).
-
-Start with 5–10 manuals to validate the pipeline before scaling up.
+Edit `config.py` and set `MYFIXIT_CATEGORIES` to whichever categories you
+want (options: `Mac`, `Car and Truck`, `Household`, `Computer Hardware`,
+`Appliance`, `Camera`, `PC`, `Electronics`, `Phone`, `Game Console`,
+`Skills`, `Vehicle`, `Media Player`, `Apparel`, `Tablet`). Start with 1-2
+small categories to validate the pipeline.
 
 ```bash
-cd src
-python download_manuals.py
+python download_myfixit.py
 ```
 
-Saves PDFs into `manuals/` and writes `manuals/manifest.json`, tagging each
-file with `product_name`, `category`, and `manual_type`.
-
-> **Before doing this at scale:** check Samsung's site terms for scraping
-> restrictions. Downloading a handful of manuals for a personal/educational
-> project is a different footprint than mass-downloading their catalog.
+Downloads the category JSON files directly from the dataset's GitHub repo
+into `data/myfixit_jsons/`.
 
 ## Step 2 — Ingest into Qdrant
 
 ```bash
-python ingest_to_qdrant.py
+python ingest_myfixit_to_qdrant.py
 ```
 
-Extracts text per PDF page, chunks it, embeds each chunk with
-`all-MiniLM-L6-v2`, and upserts into the `samsung_manuals` Qdrant collection.
+Parses each manual's steps (each step's `Text_raw` is already a natural
+chunk — no character-based chunking needed), embeds with
+`all-MiniLM-L6-v2`, and upserts into the `myfixit_manuals` Qdrant
+collection with metadata attached.
 
 ## Step 3 — Search
 
@@ -80,28 +74,34 @@ Or from your own code:
 
 ```python
 from search import search
-results = search("how do I factory reset my phone", product_name="Galaxy S24")
+results = search("how do I replace the battery", category="Phone")
 ```
 
-Omit `product_name`/`category` to search across all indexed manuals.
+## Data format note
 
-## Known limitations
-
-- Scanned/image-based manual pages won't extract text without OCR
-  (flagged with a warning during ingestion)
-- Table-heavy sections (spec sheets) may extract poorly, same limitation
-  noted in `pdf_q-a`
+Each category file in the dataset is **JSON-lines** (one JSON object per
+line), not a single JSON array — `myfixit_processing.py` reads it that way.
 
 ## Next step
 
-Wire retrieved chunks + the user's question into an LLM call (e.g. Groq) to
-generate the final answer, then wrap it in a small Gradio UI for a live demo
-— same pattern as `pdf_q-a`.
+Wire retrieved chunks + the user's question into an LLM call (Groq) to
+generate the final answer.
+
+## Citation
+
+If you use this dataset, cite the original paper:
+
+```
+Nabizadeh, N., Kolossa, D., & Heckmann, M. (2020). MyFixit: An Annotated
+Dataset, Annotation Tool, and Baseline Methods for Information Extraction
+from Repair Manuals. Proceedings of The 12th Language Resources and
+Evaluation Conference (LREC 2020), 2120-2128.
+```
 
 ## Files
 
-- `src/config.py` — chunking, embedding, and Qdrant settings
-- `src/download_manuals.py` — fetches manuals, builds `manifest.json`
-- `src/pdf_processing.py` — text extraction + chunking
-- `src/ingest_to_qdrant.py` — embeds chunks, upserts into Qdrant
-- `src/search.py` — filtered semantic search
+- `config.py` — embedding, Qdrant, and category settings
+- `download_myfixit.py` — fetches category JSON files from GitHub
+- `myfixit_processing.py` — parses JSON-lines manuals into step-level chunks
+- `ingest_myfixit_to_qdrant.py` — embeds chunks, upserts into Qdrant
+- `search.py` — filtered semantic search
