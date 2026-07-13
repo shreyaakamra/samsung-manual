@@ -1,95 +1,121 @@
 # Repair Manual RAG (MyFixit)
 
-A Retrieval-Augmented Generation (RAG) pipeline over the [MyFixit dataset](https://github.com/rub-ksv/MyFixit-Dataset)
-— 31,601 repair manuals across 15 device categories, collected from
-[iFixit](https://www.ifixit.com). Indexed into Qdrant with per-guide
-metadata (category, subject, guide title) so questions can be scoped to a
-specific device category (e.g. "Phone" only) instead of searching everything.
+A Retrieval-Augmented Generation pipeline that lets users ask natural-language repair questions ("how do I replace my phone's battery?") and get back the relevant repair steps, filtered to the correct device category, sourced from real iFixit repair guides.
 
-## Why this pivot
+---
 
-An earlier version of this project scraped Samsung manuals directly as
-PDFs. This dataset is a better fit for a few reasons:
+## 1. Problem Statement
 
-- **Already structured** — each manual is JSON with steps pre-segmented,
-  so there's no PDF text-extraction step (no scanned pages, no broken
-  table extraction, no OCR needed).
-- **Metadata included** — `Category`, `Subject`, and `Title` map directly
-  onto the filtering fields the pipeline needs, instead of being
-  hand-typed per manual.
-- **Clearly licensed for this use** — released for research/dataset use;
-  cite the paper below if you use it.
+Repair manuals for consumer electronics are scattered, unstructured, and hard to search. A user with a broken device typically has to:
 
-Framing note: this is **repair guidance** (how to disassemble/fix a
-device), not general **user manual** content (how to use its features).
-"How do I replace my phone's battery" is a great support-bot query for
-this dataset; "how do I turn on dark mode" is not — that's the kind of
-question the original PDF-manual approach was built for.
+- Search the web and land on multiple conflicting guides
+- Wade through a full PDF or web page to find the two steps that matter
+- Manually filter out irrelevant results (e.g. car repair steps showing up next to phone repair steps, because "battery" and "screen" are generic terms across product categories)
 
-## Setup
+A first version of this project tried to solve this by scraping Samsung PDF manuals directly. That approach ran into the usual problems with unstructured source data: scanned/image-only pages with no extractable text, broken table extraction, and no consistent metadata to filter on.
+
+**The problem this project solves:** given a natural-language repair question, retrieve the specific, correct repair steps — scoped to the right device category — without requiring the user to manually sift through an entire manual or a mix of irrelevant categories.
+
+---
+
+## 2. Project Description
+
+This project pivoted away from PDF scraping to the [MyFixit Dataset](https://github.com/rub-ksv/MyFixit-Dataset): 31,601 repair guides across 15 device categories, collected from [iFixit](https://www.ifixit.com), released for research use with pre-segmented steps and structured metadata.
+
+**Why the pivot made sense:**
+
+| | PDF scraping (v1) | MyFixit dataset (v2, this repo) |
+|---|---|---|
+| Text extraction | Manual, breaks on scanned pages | Not needed — steps are already segmented JSON fields |
+| Chunking | Character-based sliding window, chunk boundaries can split a step mid-sentence | Not needed — each step is already a natural chunk |
+| Metadata | Hand-typed per manual | `Category`, `Subject`, `Title` ship with the dataset |
+| Licensing | Scraping ToS ambiguity | Clearly licensed for research/dataset use |
+
+**Important framing distinction:** this is a **repair guidance** system ("how do I disassemble/fix X"), not a **user manual** system ("how do I turn on dark mode"). The MyFixit dataset only covers the former — the latter is what the original PDF-manual project was aimed at, and that distinction is worth being explicit about if asked in an interview why two related-but-different projects exist.
+
+---
+
+## 3. Technical Architecture
+
+```
+MyFixit-Dataset (GitHub, per-category JSON-lines)
+        │
+        ▼
+ download_myfixit.py  ──► data/myfixit_jsons/<Category>.json
+        │
+        ▼
+ myfixit_processing.py  ──► parses each guide's steps into Chunk objects
+        │                    (Category, Subject, Title, step_order, url, step text)
+        ▼
+ ingest_myfixit_to_qdrant.py
+        │  - embeds each step's text with all-MiniLM-L6-v2 (384-dim)
+        │  - batches embeddings (batch_size=256) to bound memory/request size
+        ▼
+   Qdrant collection (cosine similarity)
+        │  payload per point: text, guide_title, guide_id, category,
+        │  subject, step_order, step_id, url
+        ▼
+ search.py  ──► embeds the query, applies optional category/subject
+                filter (Qdrant FieldCondition/MatchValue), returns top-k
+        │
+        ▼
+   [NOT YET BUILT] Generation step — wire retrieved chunks + question
+   into a Groq LLM call to produce a final natural-language answer
+```
+
+**Component choices and the reasoning behind them:**
+
+- **Embedding model — `all-MiniLM-L6-v2`:** carried over from the earlier `pdf_q-a` project. Small (384-dim), fast on CPU, good enough recall for a portfolio-scale corpus without needing GPU inference.
+- **Vector DB — Qdrant:** supports payload-based filtering natively (`category`, `subject`), which is the core UX requirement here — scoping search to one device category instead of searching everything. Chosen over FAISS (used in the earlier `pdf_q-a` project) specifically because FAISS doesn't do structured metadata filtering as a first-class feature.
+- **No chunking step:** unlike the PDF pipeline (`chunk_size=600`, `chunk_overlap=80`), each MyFixit step's `Text_raw` field is already a coherent, appropriately-sized unit — so introducing a sliding-window chunker here would just re-fragment already-good data.
+- **Retrieval, not yet generation:** the repo currently implements retrieval only. `search.py` returns ranked, filtered chunks with their source guide and URL. The README's own "Next step" section calls out that wiring these into a Groq call for answer synthesis hasn't been done yet.
+
+---
+
+## 4. Success Criteria — and how it's actually being measured today
+
+Because generation isn't wired up yet, "success" for the current state of this repo is a **retrieval-quality question**, not an end-to-end answer-quality question. Framed honestly:
+
+| Criterion | What it means | Current measurement status |
+|---|---|---|
+| **Category filtering works** | Querying with `category="Phone"` never returns `Car and Truck` results | Verified manually via `search.py`'s `__main__` example (`"how do I replace the battery", category="Phone"`) — no automated test suite yet |
+| **Retrieved steps are topically relevant** | Top-k results are steps that plausibly answer the query | Eyeballed via printed `score`, `guide_title`, and step text snippet — no held-out relevance-labeled eval set yet |
+| **Source traceability** | Every retrieved chunk can be traced back to its original guide | Yes by construction — `url`, `guide_id`, and `step_order` are stored in the Qdrant payload and printed with every result |
+| **Ingestion completeness** | All steps in a downloaded category file make it into Qdrant | Logged via chunk counts printed per category and per batch during ingestion — not cross-checked against source file line counts |
+| **End-to-end answer quality** | A generated answer is grounded in retrieved steps and actually answers the question | **Not measurable yet** — generation step doesn't exist in this repo |
+
+**Honest summary:** success so far = "does filtered semantic search return the right guide for a manually-tried query." That's a reasonable checkpoint for a retrieval layer, but it isn't a rigorous evaluation (no labeled query set, no precision/recall numbers, no automated regression tests). If asked in an interview "how did you measure success," the accurate answer is *manual spot-checking of retrieval results*, not a formal eval harness — worth saying plainly rather than overstating it.
+
+---
+
+## 5. Limitations
+
+- **No generation layer.** The pipeline stops at retrieval. There is no LLM call that turns retrieved steps into a natural-language answer yet — this is the explicit "Next step" in the original README.
+- **No automated evaluation.** No labeled query/answer set, no precision@k or recall@k numbers, no regression tests for retrieval quality. Success is currently assessed by manually reading printed results.
+- **Known code inconsistencies (as of the current `main` branch):**
+  - `download_myfixit.py` imports `MYFIXIT_CATEGORIES`, `MYFIXIT_BASE_URL`, and `MYFIXIT_JSONS_DIR` from `config.py`, but `config.py` doesn't currently define them — running the script as-is will raise an `ImportError`.
+  - `ingest_myfixit_to_qdrant.py` imports `process_category_file` from `myfixit_processing.py`, but that file still contains the old PDF-chunking functions (`extract_pages`, `chunk_text`, `process_pdf`) from the earlier Samsung-PDF version, not a `process_category_file` function. This looks like an in-progress refactor that wasn't fully pushed.
+- **Legacy naming.** The Qdrant collection is still named `samsung_manuals` in `config.py`, left over from before the pivot to the MyFixit dataset — cosmetic, but worth cleaning up so the code matches the current data source.
+- **No reranking.** Retrieval is single-stage cosine similarity over bi-encoder embeddings — no cross-encoder reranking pass to improve precision on ambiguous queries.
+- **Partial dataset coverage by design.** Only categories explicitly listed in `MYFIXIT_CATEGORIES` get downloaded and indexed — the system doesn't index all 31,601 guides unless every category is added, which is a reasonable dev-time choice but means "coverage" is whatever's been configured, not the full dataset.
+- **No deployment/serving layer.** This is a set of pipeline scripts run from the command line (`download_myfixit.py` → `ingest_myfixit_to_qdrant.py` → `search.py`), not a deployed app with a UI — unlike the `pdf_q-a` project, which was deployed to Hugging Face Spaces with a Gradio front end.
+- **No API key / cost guardrails yet** for the planned Groq generation step, since that step doesn't exist in the repo yet.
+
+---
+
+## 6. Setup
 
 ```bash
 pip install -r requirements.txt
+docker run -p 6333:6333 qdrant/qdrant   # run Qdrant locally
 ```
 
-Run Qdrant locally:
-
-```bash
-docker run -p 6333:6333 qdrant/qdrant
-```
-
-## Step 1 — Download category data
-
-Edit `config.py` and set `MYFIXIT_CATEGORIES` to whichever categories you
-want (options: `Mac`, `Car and Truck`, `Household`, `Computer Hardware`,
-`Appliance`, `Camera`, `PC`, `Electronics`, `Phone`, `Game Console`,
-`Skills`, `Vehicle`, `Media Player`, `Apparel`, `Tablet`). Start with 1-2
-small categories to validate the pipeline.
-
-```bash
-python download_myfixit.py
-```
-
-Downloads the category JSON files directly from the dataset's GitHub repo
-into `data/myfixit_jsons/`.
-
-## Step 2 — Ingest into Qdrant
-
-```bash
-python ingest_myfixit_to_qdrant.py
-```
-
-Parses each manual's steps (each step's `Text_raw` is already a natural
-chunk — no character-based chunking needed), embeds with
-`all-MiniLM-L6-v2`, and upserts into the `myfixit_manuals` Qdrant
-collection with metadata attached.
-
-## Step 3 — Search
-
-```bash
-python search.py
-```
-
-Or from your own code:
-
-```python
-from search import search
-results = search("how do I replace the battery", category="Phone")
-```
-
-## Data format note
-
-Each category file in the dataset is **JSON-lines** (one JSON object per
-line), not a single JSON array — `myfixit_processing.py` reads it that way.
-
-## Next step
-
-Wire retrieved chunks + the user's question into an LLM call (Groq) to
-generate the final answer.
+1. Edit `config.py` — set `MYFIXIT_CATEGORIES` to the categories you want (`Phone`, `Appliance`, `Computer Hardware`, etc. — start with 1-2 small ones to validate the pipeline).
+2. `python download_myfixit.py` — pulls category JSON files into `data/myfixit_jsons/`.
+3. `python ingest_myfixit_to_qdrant.py` — embeds and upserts steps into Qdrant.
+4. `python search.py` — run a filtered semantic search, or import `search()` directly.
 
 ## Citation
-
-If you use this dataset, cite the original paper:
 
 ```
 Nabizadeh, N., Kolossa, D., & Heckmann, M. (2020). MyFixit: An Annotated
@@ -97,11 +123,3 @@ Dataset, Annotation Tool, and Baseline Methods for Information Extraction
 from Repair Manuals. Proceedings of The 12th Language Resources and
 Evaluation Conference (LREC 2020), 2120-2128.
 ```
-
-## Files
-
-- `config.py` — embedding, Qdrant, and category settings
-- `download_myfixit.py` — fetches category JSON files from GitHub
-- `myfixit_processing.py` — parses JSON-lines manuals into step-level chunks
-- `ingest_myfixit_to_qdrant.py` — embeds chunks, upserts into Qdrant
-- `search.py` — filtered semantic search
